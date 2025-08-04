@@ -1,0 +1,17 @@
+{
+  "name": "juned-gpt-api",
+  "version": "1.0.0",
+  "description": "Advanced GPT API with deep research, dolphin image generator, and system info",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Shaikh Juned",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
+
