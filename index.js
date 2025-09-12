@@ -8,9 +8,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-// NOTE: g4f is an optional external dependency that proxies to free GPT-like providers.
-// Install via npm: npm install g4f
-// If you do not want to use g4f, you can replace the `callAI` implementation with any other provider.
+// NOTE: g4f is optional. Install via: npm install g4f
 let g4f;
 try {
   g4f = require('g4f');
@@ -32,35 +30,35 @@ const LOGS = [];         // array of { timestamp, sessionId, message, ip }
 function newSessionId() {
   return crypto.randomUUID();
 }
-
 function nowISO() {
   return new Date().toISOString();
 }
 
+// ---------------------------
 // AI call wrapper
+// ---------------------------
 async function callAI(messages, options = {}) {
-  // messages: array of { role, content }
-  // options: { provider, model, timeoutMs }
+  // If you want to mock the AI for debugging, uncomment the next line and return a mock reply:
+  // return Promise.resolve("Mock reply: GPT4Free unavailable. (enable real g4f when ready)");
+
   if (!g4f) throw new Error('g4f library not available. Install dependency "g4f".');
 
-  // g4f.chatCompletion expects array of messages similar to OpenAI format.
-  // Different versions of g4f may expose different APIs; adapt if needed.
   try {
     const provider = (g4f && g4f.providers && g4f.providers.GPT) ? g4f.providers.GPT : undefined;
     const model = options.model || 'gpt-4';
     const response = await g4f.chatCompletion(messages, { provider, model });
-    // g4f often returns a plain text string as the assistant content.
     return String(response);
   } catch (err) {
-    // propagate error
-    throw err;
+    // rethrow after adding context
+    const e = new Error('g4f chatCompletion error: ' + (err && err.message ? err.message : String(err)));
+    e.inner = err;
+    throw e;
   }
 }
 
-// Middleware: simple request logger
+// Middleware: simple request logger (also writes to access.log)
 app.use((req, res, next) => {
   const entry = { ts: nowISO(), method: req.method, path: req.path, ip: req.ip };
-  // write to daily log file (append)
   const logLine = JSON.stringify(entry) + '\n';
   try {
     fs.appendFileSync(path.join(__dirname, 'access.log'), logLine);
@@ -68,6 +66,18 @@ app.use((req, res, next) => {
     // ignore file write errors
   }
   next();
+});
+
+// Root route so browsers don't show "could not get /"
+app.get('/', (req, res) => {
+  res.json({
+    message: "Shaikh Juned Advanced AI API is running!",
+    endpoints: {
+      chat: "/api/chat (POST)",
+      health: "/healthz (GET)",
+      admin_login: "/admin/login (POST)"
+    }
+  });
 });
 
 // Public chat endpoint (no auth) - supports session-based multi-turn chat
@@ -84,7 +94,6 @@ app.post('/api/chat', async (req, res) => {
     const sid = sessionId && typeof sessionId === 'string' ? sessionId : newSessionId();
     if (!SESSIONS[sid]) {
       SESSIONS[sid] = [];
-      // Optionally add system prompt if provided
       if (systemPrompt && typeof systemPrompt === 'string' && systemPrompt.trim().length) {
         SESSIONS[sid].push({ role: 'system', content: systemPrompt, timestamp: nowISO() });
       }
@@ -106,7 +115,8 @@ app.post('/api/chat', async (req, res) => {
       aiReply = await callAI(messagesForAI, { model: process.env.DEFAULT_MODEL || 'gpt-4' });
     } catch (aiErr) {
       console.error('AI call failed:', aiErr && aiErr.message ? aiErr.message : aiErr);
-      return res.status(502).json({ error: 'AI provider error', details: String(aiErr) });
+      if (aiErr && aiErr.inner) console.error('AI inner error stack:', aiErr.inner.stack || aiErr.inner);
+      return res.status(502).json({ error: 'AI provider error', details: String(aiErr && aiErr.message ? aiErr.message : aiErr) });
     }
 
     // Store assistant reply
@@ -154,7 +164,6 @@ function verifyAdminToken(req, res, next) {
 
 // Admin endpoints (protected)
 app.get('/admin/sessions', verifyAdminToken, (req, res) => {
-  // Return list of session IDs and basic metadata
   const sessionsMeta = Object.entries(SESSIONS).map(([sid, msgs]) => ({
     sessionId: sid,
     messages: msgs.length,
@@ -172,24 +181,21 @@ app.get('/admin/session/:id', verifyAdminToken, (req, res) => {
 });
 
 app.get('/admin/logs', verifyAdminToken, (req, res) => {
-  // Support basic query params: limit, since
   const limit = Math.min(1000, Math.abs(parseInt(req.query.limit || '100')));
   const since = req.query.since ? new Date(req.query.since) : null;
-  let items = LOGS.slice().reverse(); // newest first
+  let items = LOGS.slice().reverse();
   if (since && !isNaN(since.getTime())) {
     items = items.filter(l => new Date(l.timestamp) >= since);
   }
   res.json({ count: items.length, logs: items.slice(0, limit) });
 });
 
-// Admin endpoint to clear sessions (dangerous - protected)
 app.post('/admin/clear-sessions', verifyAdminToken, (req, res) => {
-  const keep = req.body.keep || 0; // keep N recent sessions (by insertion order)
+  const keep = req.body.keep || 0;
   if (keep <= 0) {
     for (const k of Object.keys(SESSIONS)) delete SESSIONS[k];
     return res.json({ cleared: true, remaining: 0 });
   }
-  // Keep the most recent N sessions by last message time
   const ordered = Object.entries(SESSIONS)
     .map(([sid, msgs]) => ({ sid, last: msgs.length ? msgs[msgs.length - 1].timestamp : null }))
     .sort((a,b) => (b.last || '').localeCompare(a.last || ''));
