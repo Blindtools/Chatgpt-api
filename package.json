@@ -1,0 +1,21 @@
+{
+  "name": "shaikh_juned_api",
+  "version": "1.0.0",
+  "description": "Advanced public Chat API using GPT4Free (g4f) - created for Shaikh Juned",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start:dev": "NODE_ENV=development node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "g4f": "^1.4.6",
+    "jsonwebtoken": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
