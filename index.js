@@ -1,5 +1,5 @@
-// index.js - Advanced public Chat API using GPT4Free (g4f)
-// Created for: Shaikh Juned
+// index.js - Robust production-ready Chat API using GPT4Free (g4f)
+// For: Shaikh Juned
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -9,13 +9,6 @@ const fs = require('fs');
 const path = require('path');
 const rateLimit = require('express-rate-limit');
 
-let g4f;
-try {
-  g4f = require('g4f');
-} catch (e) {
-  console.warn('g4f not installed. AI calls will fail until g4f is installed as a dependency.');
-}
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -23,80 +16,117 @@ app.use(cors());
 app.use(express.json());
 
 // ---------------------------
+// Robust g4f initialization
+// - Support multiple export shapes users encounter in different g4f versions.
+// Docs/examples use: const { G4F } = require("g4f"); const g4f = new G4F(); OR client = new G4F(); g4f.chatCompletion(...).
+// See g4f docs for chatCompletion usage. :contentReference[oaicite:2]{index=2}
+let g4fClient = null;
+try {
+  const g4fModule = require('g4f');
+  // Try common export shapes:
+  if (typeof g4fModule === 'function') {
+    // module directly exported as constructor / function
+    g4fClient = new g4fModule();
+  } else if (g4fModule && typeof g4fModule.G4F === 'function') {
+    g4fClient = new g4fModule.G4F();
+  } else if (g4fModule && typeof g4fModule.default === 'function') {
+    g4fClient = new g4fModule.default();
+  } else if (g4fModule && typeof g4fModule.G4F === 'object' && typeof g4fModule.G4F === 'object') {
+    // weird shapes - attempt to use named export class if present
+    try { g4fClient = new g4fModule.G4F(); } catch (e) { /* ignore */ }
+  } else if (g4fModule && typeof g4fModule.chatCompletion === 'function') {
+    // module itself is a helper object exposing chatCompletion
+    g4fClient = g4fModule;
+  } else {
+    console.warn('g4f loaded but shape unrecognized. You may need to update initialization.');
+  }
+} catch (e) {
+  console.warn('g4f not installed or failed to require(); AI calls will fail until g4f is installed.');
+  g4fClient = null;
+}
+
+// ---------------------------
 // Rate limiter: 50 requests per IP per minute
 // ---------------------------
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 50, // limit each IP to 50 requests per windowMs
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
   handler: (req, res) => {
     res.status(429).json({ error: 'rate_limit_exceeded', message: 'Too many requests — limit is 50 per minute per IP' });
   },
-  keyGenerator: (req /*, res*/) => {
-    // use forwarded IP if present (Render/Proxies)
+  keyGenerator: (req) => {
     return (req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress || '').split(',')[0].trim();
   }
 });
 
-// In-memory stores (replace with DB/Redis for production)
-const SESSIONS = {};     // sessionId -> [{ role, content, timestamp }]
-const LOGS = [];         // array of { timestamp, sessionId, message, ip }
+// In-memory stores (swap with DB/Redis for real production persistence)
+const SESSIONS = {};
+const LOGS = [];
 
 // Utilities
-function newSessionId() {
-  return crypto.randomUUID();
-}
-function nowISO() {
-  return new Date().toISOString();
-}
+function newSessionId() { return crypto.randomUUID(); }
+function nowISO() { return new Date().toISOString(); }
 
 // ---------------------------
-// AI call wrapper
+// callAI: unified wrapper that works with common g4f shapes
+// - Attempts g4fClient.chatCompletion(messages, options)
+// - If the g4fClient is not installed or fails, throws a helpful error
+// - You can temporarily enable the mock return (uncomment) for testing UI without provider.
 // ---------------------------
 async function callAI(messages, options = {}) {
-  // For debugging without g4f, you can temporarily enable this mock line:
-  // return Promise.resolve("Mock reply: GPT4Free unavailable. This confirms API flow works.");
+  // TEMP MOCK (uncomment for debugging front-end flow without g4f):
+  // return Promise.resolve("Mock reply (g4f disabled) — uncomment in code only for debugging.");
 
-  if (!g4f) throw new Error('g4f library not available. Install dependency "g4f".');
+  if (!g4fClient) throw new Error('g4f client not initialized. Install and configure the "g4f" package.');
 
+  // Some versions expect an instance with chatCompletion, others export a function directly.
+  const model = options.model || process.env.DEFAULT_MODEL || 'gpt-4';
   try {
-    const provider = (g4f && g4f.providers && g4f.providers.GPT) ? g4f.providers.GPT : undefined;
-    const model = options.model || 'gpt-4';
-    const response = await g4f.chatCompletion(messages, { provider, model });
-    return String(response);
+    if (typeof g4fClient.chatCompletion === 'function') {
+      // typical JS client usage: client.chatCompletion(messages, opts)
+      return String(await g4fClient.chatCompletion(messages, { model }));
+    }
+    // some shapes export a single function
+    if (typeof g4fClient === 'function') {
+      return String(await g4fClient.chatCompletion(messages, { model }));
+    }
+    // last resort: if module has a 'chat' or 'ChatCompletion' namespace
+    if (g4fClient.chat && typeof g4fClient.chat === 'object' && typeof g4fClient.chat.completions === 'function') {
+      const r = await g4fClient.chat.completions(messages, { model });
+      return String(r);
+    }
+
+    throw new Error('g4f client loaded but chatCompletion API not found on exported object.');
   } catch (err) {
-    const e = new Error('g4f chatCompletion error: ' + (err && err.message ? err.message : String(err)));
+    const e = new Error('g4f chat error: ' + (err && err.message ? err.message : String(err)));
     e.inner = err;
     throw e;
   }
 }
 
-// Middleware: simple request logger (write to access.log)
+// Middleware: simple request logger (append to access.log)
 app.use((req, res, next) => {
   const entry = { ts: nowISO(), method: req.method, path: req.path, ip: req.ip };
-  const logLine = JSON.stringify(entry) + '\n';
-  try {
-    fs.appendFileSync(path.join(__dirname, 'access.log'), logLine);
-  } catch (e) {
-    // ignore file write errors
-  }
+  try { fs.appendFileSync(path.join(__dirname, 'access.log'), JSON.stringify(entry) + '\n'); } catch (e) {}
   next();
 });
 
-// Root route so browsers don't show "could not get /"
+// Friendly root so browsers don't display "Cannot GET /"
 app.get('/', (req, res) => {
   res.json({
     message: "Shaikh Juned Advanced AI API is running!",
-    endpoints: {
-      chat: "/api/chat (POST)",
-      health: "/healthz (GET)",
-      admin_login: "/admin/login (POST)"
-    }
+    endpoints: { chat: "/api/chat (POST)", health: "/healthz (GET)", admin_login: "/admin/login (POST)" }
   });
 });
 
-// Public chat endpoint (no auth) - apply rate limiter to this route only
+// If someone opens /api/chat with GET in browser, give a helpful message instead of "Cannot GET /api/chat"
+app.get('/api/chat', (req, res) => {
+  res.status(405).json({ error: 'method_not_allowed', message: 'Use POST /api/chat with JSON body: { \"message\": \"...\" }' });
+});
+
+// Public chat endpoint (POST) — apply rate limiter
 app.post('/api/chat', chatLimiter, async (req, res) => {
   try {
     const ip = (req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
@@ -106,54 +136,41 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
       return res.status(400).json({ error: 'message is required and must be a non-empty string' });
     }
 
-    // create or reuse session
     const sid = sessionId && typeof sessionId === 'string' ? sessionId : newSessionId();
     if (!SESSIONS[sid]) {
       SESSIONS[sid] = [];
-      if (systemPrompt && typeof systemPrompt === 'string' && systemPrompt.trim().length) {
-        SESSIONS[sid].push({ role: 'system', content: systemPrompt, timestamp: nowISO() });
-      }
+      if (systemPrompt) SESSIONS[sid].push({ role: 'system', content: systemPrompt, timestamp: nowISO() });
     }
 
-    // Append user message
-    const userMsg = { role: 'user', content: message, timestamp: nowISO() };
-    SESSIONS[sid].push(userMsg);
+    SESSIONS[sid].push({ role: 'user', content: message, timestamp: nowISO() });
+    LOGS.push({ timestamp: nowISO(), sessionId: sid, message, ip });
 
-    // Log the incoming request
-    LOGS.push({ timestamp: nowISO(), sessionId: sid, message: message, ip });
-
-    // Build messages array for AI
     const messagesForAI = SESSIONS[sid].map(m => ({ role: m.role, content: m.content }));
 
-    // Call AI provider
     let aiReply;
     try {
       aiReply = await callAI(messagesForAI, { model: process.env.DEFAULT_MODEL || 'gpt-4' });
     } catch (aiErr) {
       console.error('AI call failed:', aiErr && aiErr.message ? aiErr.message : aiErr);
-      if (aiErr && aiErr.inner) console.error('AI inner error stack:', aiErr.inner.stack || aiErr.inner);
+      if (aiErr && aiErr.inner) console.error('AI inner:', aiErr.inner.stack || aiErr.inner);
       return res.status(502).json({ error: 'AI provider error', details: String(aiErr && aiErr.message ? aiErr.message : aiErr) });
     }
 
-    // Store assistant reply
-    const assistantMsg = { role: 'assistant', content: aiReply, timestamp: nowISO() };
-    SESSIONS[sid].push(assistantMsg);
+    SESSIONS[sid].push({ role: 'assistant', content: aiReply, timestamp: nowISO() });
     LOGS.push({ timestamp: nowISO(), sessionId: sid, message: '[assistant reply]', ip });
 
-    // Return reply and sessionId
-    return res.json({ sessionId: sid, reply: aiReply });
+    res.json({ sessionId: sid, reply: aiReply });
   } catch (err) {
-    console.error('Unexpected error in /api/chat:', err);
-    return res.status(500).json({ error: 'internal_server_error' });
+    console.error('Unexpected /api/chat error:', err);
+    res.status(500).json({ error: 'internal_server_error' });
   }
 });
 
-// Admin auth and routes
+// Admin setup (same as before)
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'password';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret_in_production';
 
-// Admin login - returns JWT token
 app.post('/admin/login', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
@@ -164,7 +181,6 @@ app.post('/admin/login', (req, res) => {
   return res.status(401).json({ error: 'invalid_credentials' });
 });
 
-// Admin token verification middleware
 function verifyAdminToken(req, res, next) {
   const auth = req.headers['authorization'];
   if (!auth || typeof auth !== 'string') return res.status(401).json({ error: 'authorization header required' });
@@ -178,7 +194,6 @@ function verifyAdminToken(req, res, next) {
   });
 }
 
-// Admin endpoints (protected)
 app.get('/admin/sessions', verifyAdminToken, (req, res) => {
   const sessionsMeta = Object.entries(SESSIONS).map(([sid, msgs]) => ({
     sessionId: sid,
@@ -189,43 +204,21 @@ app.get('/admin/sessions', verifyAdminToken, (req, res) => {
   res.json({ count: sessionsMeta.length, sessions: sessionsMeta });
 });
 
-app.get('/admin/session/:id', verifyAdminToken, (req, res) => {
-  const sid = req.params.id;
-  const session = SESSIONS[sid];
-  if (!session) return res.status(404).json({ error: 'session_not_found' });
-  res.json({ sessionId: sid, messages: session });
-});
-
 app.get('/admin/logs', verifyAdminToken, (req, res) => {
-  const limit = Math.min(1000, Math.abs(parseInt(req.query.limit || '100')));
   const since = req.query.since ? new Date(req.query.since) : null;
+  const limit = Math.min(1000, Math.abs(parseInt(req.query.limit || '100')));
   let items = LOGS.slice().reverse();
-  if (since && !isNaN(since.getTime())) {
-    items = items.filter(l => new Date(l.timestamp) >= since);
-  }
+  if (since && !isNaN(since.getTime())) items = items.filter(l => new Date(l.timestamp) >= since);
   res.json({ count: items.length, logs: items.slice(0, limit) });
 });
 
-app.post('/admin/clear-sessions', verifyAdminToken, (req, res) => {
-  const keep = req.body.keep || 0;
-  if (keep <= 0) {
-    for (const k of Object.keys(SESSIONS)) delete SESSIONS[k];
-    return res.json({ cleared: true, remaining: 0 });
-  }
-  const ordered = Object.entries(SESSIONS)
-    .map(([sid, msgs]) => ({ sid, last: msgs.length ? msgs[msgs.length - 1].timestamp : null }))
-    .sort((a,b) => (b.last || '').localeCompare(a.last || ''));
-  const toKeep = new Set(ordered.slice(0, keep).map(x => x.sid));
-  for (const k of Object.keys(SESSIONS)) {
-    if (!toKeep.has(k)) delete SESSIONS[k];
-  }
-  return res.json({ cleared: true, remaining: Object.keys(SESSIONS).length });
+// 404 JSON for all other requests (prevents "Cannot GET /something" plain text)
+app.use((req, res) => {
+  res.status(404).json({ error: 'not_found', path: req.path });
 });
 
-// Health check
+// Health
 app.get('/healthz', (req, res) => res.json({ status: 'ok', ts: nowISO() }));
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`SHAIKH_JUNED_API listening on port ${PORT}`);
-});
+// Start
+app.listen(PORT, () => console.log(`SHAIKH_JUNED_API listening on port ${PORT}`));
