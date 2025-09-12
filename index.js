@@ -7,8 +7,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
 
-// NOTE: g4f is optional. Install via: npm install g4f
 let g4f;
 try {
   g4f = require('g4f');
@@ -21,6 +21,23 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// ---------------------------
+// Rate limiter: 50 requests per IP per minute
+// ---------------------------
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 50, // limit each IP to 50 requests per windowMs
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  handler: (req, res) => {
+    res.status(429).json({ error: 'rate_limit_exceeded', message: 'Too many requests — limit is 50 per minute per IP' });
+  },
+  keyGenerator: (req /*, res*/) => {
+    // use forwarded IP if present (Render/Proxies)
+    return (req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress || '').split(',')[0].trim();
+  }
+});
 
 // In-memory stores (replace with DB/Redis for production)
 const SESSIONS = {};     // sessionId -> [{ role, content, timestamp }]
@@ -38,8 +55,8 @@ function nowISO() {
 // AI call wrapper
 // ---------------------------
 async function callAI(messages, options = {}) {
-  // If you want to mock the AI for debugging, uncomment the next line and return a mock reply:
-  // return Promise.resolve("Mock reply: GPT4Free unavailable. (enable real g4f when ready)");
+  // For debugging without g4f, you can temporarily enable this mock line:
+  // return Promise.resolve("Mock reply: GPT4Free unavailable. This confirms API flow works.");
 
   if (!g4f) throw new Error('g4f library not available. Install dependency "g4f".');
 
@@ -49,14 +66,13 @@ async function callAI(messages, options = {}) {
     const response = await g4f.chatCompletion(messages, { provider, model });
     return String(response);
   } catch (err) {
-    // rethrow after adding context
     const e = new Error('g4f chatCompletion error: ' + (err && err.message ? err.message : String(err)));
     e.inner = err;
     throw e;
   }
 }
 
-// Middleware: simple request logger (also writes to access.log)
+// Middleware: simple request logger (write to access.log)
 app.use((req, res, next) => {
   const entry = { ts: nowISO(), method: req.method, path: req.path, ip: req.ip };
   const logLine = JSON.stringify(entry) + '\n';
@@ -80,10 +96,10 @@ app.get('/', (req, res) => {
   });
 });
 
-// Public chat endpoint (no auth) - supports session-based multi-turn chat
-app.post('/api/chat', async (req, res) => {
+// Public chat endpoint (no auth) - apply rate limiter to this route only
+app.post('/api/chat', chatLimiter, async (req, res) => {
   try {
-    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const ip = (req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim();
     const { sessionId, message, systemPrompt } = req.body || {};
 
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
